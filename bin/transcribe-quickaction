@@ -1,0 +1,38 @@
+#!/bin/zsh
+# Обертка transcribe-meeting под macOS Quick Action (Finder).
+# Quick Action стартует с урезанным PATH - добавляем Homebrew (для ffmpeg) и ~/.local/bin.
+# Прогресс по фазам CLI ([1/4]..[4/4]) идет в уведомления с процентом (трей Automator
+# всегда показывает "0%" для shell-скриптов - это его UI, не наш).
+BREW_BIN=""
+command -v brew >/dev/null 2>&1 && BREW_BIN="$(brew --prefix)/bin"
+export PATH="${BREW_BIN}:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
+
+LOG="/tmp/transcribe-quickaction.log"; : > "$LOG"
+TITLE="Транскрибирую (GigaAM)"
+notify() { osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1 }
+
+tmpout=""
+trap '[ -n "$tmpout" ] && rm -f "$tmpout" 2>/dev/null' EXIT INT TERM
+
+for f in "$@"; do
+  b="${f:t}"
+  notify "$TITLE" "0% · $b"
+  tmpout=$(mktemp)
+  transcribe-meeting "$f" >"$tmpout" 2> >(while IFS= read -r line; do
+      print -r -- "$line" >> "$LOG"
+      case "$line" in
+        *"[1/4]"*) notify "$TITLE" "10% · извлекаю аудио" ;;
+        *"[2/4]"*) notify "$TITLE" "40% · распознаю речь (GigaAM)" ;;
+        *"[3/4]"*) notify "$TITLE" "70% · разделяю по спикерам (долгий шаг)" ;;
+        *"[4/4]"*) notify "$TITLE" "95% · пишу markdown" ;;
+      esac
+    done)
+  rc=$?
+  out=$(cat "$tmpout"); rm -f "$tmpout"; tmpout=""
+  if [ $rc -eq 0 ] && [ -n "$out" ]; then
+    notify "Готово ✅" "${out:t}"
+    open -R "$out" >/dev/null 2>&1   # показать md в Finder
+  else
+    notify "Ошибка ❌" "$b — лог: $LOG"
+  fi
+done

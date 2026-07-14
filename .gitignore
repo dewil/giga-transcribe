@@ -1,0 +1,19 @@
+# python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# install artifacts (materialized by install.sh into GIGA_TRANSCRIBE_HOME, never committed)
+venv/
+models/
+GigaAM/
+
+# stray audio / transcripts
+*.wav
+*.aiff
+*.mp3
+*.mp4
+*.webm
+*.m4a
