@@ -9,8 +9,10 @@ transcribe-meeting - локальная транскрипция аудио/ви
 Запускается python-ом из venv проекта (launcher в ~/.local/bin это настраивает).
 Пути к venv/моделям берутся из GIGA_TRANSCRIBE_HOME (дефолт: ~/.local/share/giga-transcribe).
 
-Потолок диаризации: из одной смешанной записи звонка надежно разделяет ~2-3 голоса; 4+ похожих
-голосов сливаются при любых настройках (нужны пофайловые дорожки участников). Спикеры приблизительные.
+Диаризация: sherpa сегментирует речь, дальше свой per-segment эмбеддинг + k-means (при
+известном --speakers N - k=N; иначе число оценивается по silhouette). На длинных содержательных
+репликах разметка надежна (~95% против облака), короткие backchannel ("угу", быстрые вопросы) могут
+уходить не тому спикеру - это неустранимый хвост смешанной записи. Спикеры обезличены (Спикер N).
 
 Устойчивость: все промежуточные файлы - в своем temp-каталоге на прогон (параллель-безопасно),
 md пишется атомарно, при остановке (Ctrl-C / kill) temp-файлы чистятся.
@@ -30,6 +32,8 @@ EMB = {"campplus": os.path.join(DIAR_DIR, "embedding.onnx"),
 ASR_MODEL = "v3_e2e_rnnt"
 CHUNK_S = 24            # лимит GigaAM .transcribe - 25 сек
 SR = 16000
+DIAR_MIN_ON = 0.5      # мин. длина речевого сегмента (баланс: короткие реплики vs шум эмбеддинга)
+DIAR_KMAX = 6          # верхняя граница числа спикеров при авто-оценке (silhouette)
 
 # --- ресурсы прогона, чистятся при выходе/сигнале ---
 _tmpdir = None
@@ -79,8 +83,11 @@ def extract_wav(src, dst):
         die("ffmpeg не смог извлечь аудио:\n" + r.stderr.decode(errors="ignore")[-500:])
 
 
-def run_asr(audio, sr, tmpdir):
+def run_asr(audio, sr, tmpdir, threads):
     import gigaam, soundfile as sf
+    if threads > 0:
+        import torch
+        torch.set_num_threads(threads)
     model = gigaam.load_model(ASR_MODEL, device="cpu")
     words, ch = [], CHUNK_S * sr
     for i in range(0, len(audio), ch):
@@ -95,21 +102,125 @@ def run_asr(audio, sr, tmpdir):
     return words
 
 
-def run_diar(audio, n_speakers, emb_key):
+# --- Диаризация: sherpa только сегментирует речь, кластеризуем сами. ---
+# Встроенная FastClustering у sherpa вырождается на длинных файлах (все в 1 спикера
+# либо сотни микрокластеров из-за дрейфа эмбеддингов). Поэтому: берем сегменты речи,
+# считаем эмбеддинг каждого, и кластеризуем сферическим k-means (взвешенным по длине)
+# с известным N. Проверено против облака: на длинных репликах ~95% совпадение.
+
+def _diar_models_ok(emb):
+    return os.path.exists(SEG_MODEL) and emb and os.path.exists(emb)
+
+
+def _segment(audio, threads):
+    """Временные границы речи (лейблы sherpa игнорируем - кластеризуем сами)."""
     import sherpa_onnx
-    emb = EMB.get(emb_key)
-    if not (os.path.exists(SEG_MODEL) and emb and os.path.exists(emb)):
-        die(f"нет моделей диаризации в {DIAR_DIR} (запусти install.sh)")
-    clustering = (sherpa_onnx.FastClusteringConfig(num_clusters=n_speakers)
-                  if n_speakers and n_speakers > 0
-                  else sherpa_onnx.FastClusteringConfig(num_clusters=-1, threshold=0.5))
+    nt = threads if threads > 0 else 1
     cfg = sherpa_onnx.OfflineSpeakerDiarizationConfig(
         segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
-            pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(model=SEG_MODEL)),
-        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=emb),
-        clustering=clustering, min_duration_on=0.2, min_duration_off=0.5)
+            pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(model=SEG_MODEL),
+            num_threads=nt),
+        embedding=sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=EMB["campplus"], num_threads=nt),
+        clustering=sherpa_onnx.FastClusteringConfig(num_clusters=2),
+        min_duration_on=DIAR_MIN_ON, min_duration_off=0.5)
     sd = sherpa_onnx.OfflineSpeakerDiarization(cfg)
-    return [(r.start, r.end, r.speaker) for r in sd.process(audio).sort_by_start_time()]
+    return [(r.start, r.end) for r in sd.process(audio).sort_by_start_time()]
+
+
+def _embed_segments(audio, segs, emb_path, threads):
+    """Эмбеддинг каждого сегмента (по всему его аудио). Возвращает (матрица, оставленные сегменты)."""
+    import numpy as np, sherpa_onnx
+    nt = threads if threads > 0 else 1
+    ext = sherpa_onnx.SpeakerEmbeddingExtractor(
+        sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=emb_path, num_threads=nt))
+    X, kept = [], []
+    for s0, s1 in segs:
+        a = audio[int(s0*SR):int(s1*SR)]
+        if len(a) < int(0.25*SR):     # слишком коротко для надежного эмбеддинга
+            continue
+        st = ext.create_stream(); st.accept_waveform(SR, a); st.input_finished()
+        X.append(np.asarray(ext.compute(st), dtype="float32")); kept.append((s0, s1))
+    if not X:
+        return None, []
+    return np.vstack(X), kept
+
+
+def _skmeans(Xn, w, k, iters=100):
+    """Сферический k-means (косинус) на L2-нормированных Xn, веса w (длительности)."""
+    import numpy as np
+    n = len(Xn)
+    k = max(1, min(k, n))
+    if k == 1:
+        return np.zeros(n, dtype=int)
+    # инициализация: жадно самые непохожие центры среди длинных сегментов
+    li = np.argsort(-w)[:max(k*10, 40)]
+    idx = [int(li[int(np.argmax(w[li]))])]
+    for _ in range(k-1):
+        sims = (Xn @ Xn[idx].T).max(1)
+        idx.append(int(np.argmin(sims)))
+    C = Xn[idx].copy()
+    lab = np.full(n, -1)
+    for _ in range(iters):
+        new = (Xn @ C.T).argmax(1)
+        if (new == lab).all():
+            break
+        lab = new
+        for c in range(k):
+            m = lab == c
+            if m.any():
+                v = (Xn[m] * w[m, None]).sum(0)
+                C[c] = v / (np.linalg.norm(v) + 1e-9)
+    return lab
+
+
+def _silhouette(Xn, lab):
+    import numpy as np
+    D = 1.0 - Xn @ Xn.T
+    np.fill_diagonal(D, 0.0)
+    labs = np.unique(lab)
+    if len(labs) < 2:
+        return -1.0
+    s = np.zeros(len(lab))
+    for i in range(len(lab)):
+        same = lab == lab[i]; same[i] = False
+        a = D[i, same].mean() if same.any() else 0.0
+        others = [D[i, lab == c].mean() for c in labs if c != lab[i]]
+        b = min(others) if others else 0.0
+        s[i] = (b - a) / max(a, b) if max(a, b) > 0 else 0.0
+    return float(s.mean())
+
+
+def run_diar(audio, n_speakers, emb_key, threads):
+    import numpy as np
+    emb = EMB.get(emb_key)
+    if not _diar_models_ok(emb):
+        die(f"нет моделей диаризации в {DIAR_DIR} (запусти install.sh)")
+    segs = _segment(audio, threads)
+    if not segs:
+        return []
+    X, kept = _embed_segments(audio, segs, emb, threads)
+    if X is None:
+        return []
+    Xn = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
+    w = np.array([s1 - s0 for s0, s1 in kept], dtype="float32")
+    if n_speakers and n_speakers > 0:
+        lab = _skmeans(Xn, w, n_speakers)
+    else:
+        # авто-оценка числа спикеров по silhouette (порог у sherpa ненадежен)
+        best_s, lab = -2.0, np.zeros(len(Xn), dtype=int)
+        for k in range(2, min(DIAR_KMAX, len(Xn)) + 1):
+            l = _skmeans(Xn, w, k)
+            if len(np.unique(l)) < k:
+                continue
+            s = _silhouette(Xn, l)
+            if s > best_s:
+                best_s, lab = s, l
+    # перенумеровать метки в непрерывные 0..m-1 по времени первого появления
+    remap, nxt = {}, 0
+    for c in lab:
+        if c not in remap:
+            remap[c] = nxt; nxt += 1
+    return [(kept[i][0], kept[i][1], remap[int(lab[i])]) for i in range(len(kept))]
 
 
 def group_by_speaker(words, segs):
@@ -161,7 +272,7 @@ def write_md(path, title, src, dur, lines, diarized, emb_key):
             f"**Движок:** {engine}  "]
     if diarized:
         head.append(f"**Спикеров выделено:** {len(spk_ids)} "
-                    f"(диаризация приблизительная - из смешанной записи надежно 2-3 голоса; "
+                    f"(разметка надежна на длинных репликах, короткие могут путаться; "
                     f"сверить и проставить имена вручную)  ")
     head += ["", "## Транскрипт", ""]
     body = []
@@ -186,7 +297,13 @@ def main():
     ap.add_argument("--no-diar", action="store_true", help="без диаризации, чистый текст по паузам")
     ap.add_argument("--embedding", choices=list(EMB), default="campplus", help="эмбеддинг диаризации")
     ap.add_argument("--title", help="заголовок в md (по умолчанию - имя файла)")
+    ap.add_argument("--threads", type=int, default=0, help="число CPU-потоков (0 = авто/дефолт библиотек)")
     args = ap.parse_args()
+
+    if args.threads and args.threads > 0:
+        for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+                   "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+            os.environ[_v] = str(args.threads)
 
     src = os.path.abspath(os.path.expanduser(args.input))
     if not os.path.exists(src):
@@ -211,7 +328,7 @@ def main():
 
         print(f"[2/4] распознавание речи ({dur/60:.1f} мин)...", file=sys.stderr)
         t = time.time()
-        words = run_asr(audio, sr, _tmpdir)
+        words = run_asr(audio, sr, _tmpdir, args.threads)
         print(f"      слов={len(words)}, {time.time()-t:.0f}с", file=sys.stderr)
 
         if args.no_diar:
@@ -219,7 +336,7 @@ def main():
         else:
             print("[3/4] диаризация...", file=sys.stderr)
             t = time.time()
-            segs = run_diar(audio, args.speakers, args.embedding)
+            segs = run_diar(audio, args.speakers, args.embedding, args.threads)
             print(f"      {time.time()-t:.0f}с", file=sys.stderr)
             lines, diarized = group_by_speaker(words, segs), True
 

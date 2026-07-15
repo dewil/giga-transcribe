@@ -39,7 +39,7 @@ if [ ! -d "$HOME_DIR/GigaAM" ]; then
 fi
 echo "==> ставлю GigaAM + зависимости (torch, sherpa-onnx, ...)"
 "$PY" -m pip install -e "$HOME_DIR/GigaAM[torch]"
-"$PY" -m pip install sherpa-onnx certifi soundfile
+"$PY" -m pip install sherpa-onnx certifi soundfile numpy
 
 # --- модели диаризации (token-free ONNX из релизов sherpa-onnx) ---
 if [ ! -f "$MODELS/sherpa-onnx-pyannote-segmentation-3-0/model.onnx" ]; then

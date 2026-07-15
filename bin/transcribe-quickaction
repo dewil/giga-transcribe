@@ -1,21 +1,25 @@
 #!/bin/zsh
 # Обертка transcribe-meeting под macOS Quick Action (Finder).
 # Quick Action стартует с урезанным PATH - добавляем Homebrew (для ffmpeg) и ~/.local/bin.
-# Спрашивает число участников диалогом (Enter = авто), затем гонит транскрипцию.
-# Имя файла идет в subtitle каждой нотификации; прогресс по фазам CLI ([1/4]..[4/4]) -
-# в body с процентом (трей Automator всегда показывает "0%" для shell-скриптов - это его UI).
+# Фидбэк - через ДИАЛОГИ (баннеры-уведомления osascript часто подавлены на машине, а диалоги
+# показываются всегда): стартовый диалог показывает файл и спрашивает число участников,
+# финальный (авто-закрытие) сообщает результат. Прогресс "0%" в шестеренке Automator - его UI,
+# не наш; имя файла туда не пробросить.
 BREW_BIN=""
 command -v brew >/dev/null 2>&1 && BREW_BIN="$(brew --prefix)/bin"
 export PATH="${BREW_BIN}:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
 
 LOG="/tmp/transcribe-quickaction.log"; : > "$LOG"
-TITLE="Транскрибирую (GigaAM)"
-# notify <title> <subtitle: файл> <body: фаза>
-notify() { osascript -e "display notification \"$3\" with title \"$1\" subtitle \"$2\"" >/dev/null 2>&1 }
 
-# спросить число участников один раз (применяется ко всем выбранным файлам).
+# авто-закрывающийся диалог, в фоне (не блокирует обработку)
+show() { osascript -e "display dialog \"$1\" with title \"Транскрибировать (GigaAM)\" buttons {\"OK\"} default button 1 giving up after 6" >/dev/null 2>&1 & }
+
+# стартовый диалог: показывает файл(ы) и спрашивает число участников.
 # Enter/пусто = авто; число = --speakers N; Отмена = выход.
-ans=$(osascript -e 'display dialog "Сколько участников на записи?  (Enter - авто-определение)" default answer "" with title "Транскрибировать (GigaAM)" buttons {"Отмена","OK"} default button "OK"' -e 'text returned of result' 2>/dev/null) || exit 0
+if (( $# == 1 )); then finfo="${1:t}"; else finfo="$# файлов"; fi
+ans=$(osascript -e "display dialog \"Файл: $finfo
+
+Сколько участников на записи?  (Enter - авто-определение)\" default answer \"\" with title \"Транскрибировать (GigaAM)\" buttons {\"Отмена\",\"OK\"} default button \"OK\"" -e 'text returned of result' 2>/dev/null) || exit 0
 SPK=()
 if [[ -n "$ans" && "$ans" == <-> ]] && (( ans > 0 )); then
   SPK=(--speakers "$ans")
@@ -26,23 +30,15 @@ trap '[ -n "$tmpout" ] && rm -f "$tmpout" 2>/dev/null' EXIT INT TERM
 
 for f in "$@"; do
   b="${f:t}"
-  notify "$TITLE" "$b" "0% · старт"
   tmpout=$(mktemp)
-  transcribe-meeting "${SPK[@]}" "$f" >"$tmpout" 2> >(while IFS= read -r line; do
-      print -r -- "$line" >> "$LOG"
-      case "$line" in
-        *"[1/4]"*) notify "$TITLE" "$b" "10% · извлекаю аудио" ;;
-        *"[2/4]"*) notify "$TITLE" "$b" "40% · распознаю речь (GigaAM)" ;;
-        *"[3/4]"*) notify "$TITLE" "$b" "70% · разделяю по спикерам (долгий шаг)" ;;
-        *"[4/4]"*) notify "$TITLE" "$b" "95% · пишу markdown" ;;
-      esac
-    done)
+  transcribe-meeting "${SPK[@]}" "$f" >"$tmpout" 2>>"$LOG"
   rc=$?
   out=$(cat "$tmpout"); rm -f "$tmpout"; tmpout=""
   if [ $rc -eq 0 ] && [ -n "$out" ]; then
-    notify "Готово ✅" "$b" "${out:t}"
-    open -R "$out" >/dev/null 2>&1   # показать md в Finder
+    open -R "$out" >/dev/null 2>&1        # показать md в Finder
+    show "✅ Готово: ${out:t}"
   else
-    notify "Ошибка ❌" "$b" "лог: $LOG"
+    show "❌ Ошибка: $b
+лог: $LOG"
   fi
 done
