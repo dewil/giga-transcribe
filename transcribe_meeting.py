@@ -14,15 +14,23 @@ transcribe-meeting - локальная транскрипция аудио/ви
 репликах разметка надежна (~95% против облака), короткие backchannel ("угу", быстрые вопросы) могут
 уходить не тому спикеру - это неустранимый хвост смешанной записи. Спикеры обезличены (Спикер N).
 
-Устойчивость: все промежуточные файлы - в своем temp-каталоге на прогон (параллель-безопасно),
-md пишется атомарно, при остановке (Ctrl-C / kill) temp-файлы чистятся.
+Многодорожечный вход снимает этот хвост целиком: если голоса уже разложены по дорожкам
+(пофайлово или по каналам), спикер known by construction - это сама дорожка, и диаризация
+не запускается вовсе. Разметка становится точной, а не приблизительной, и получает имена.
+Побочная выгода: на своей дорожке голос не перекрыт чужим, поэтому и ASR работает чище.
 
 Примеры:
   transcribe-meeting "встреча.mp4"
   transcribe-meeting rec.webm -o out.md --speakers 3
   transcribe-meeting audio.wav --no-diar --title "Недельный синк"
+  transcribe-meeting ivan.wav petr.wav --track-names "Иван,Петр"    # дорожка = спикер
+  transcribe-meeting call.wav --split-channels                      # каналы = спикеры
+
+Устойчивость: все промежуточные файлы - в своем temp-каталоге на прогон (параллель-безопасно),
+md пишется атомарно, при остановке (Ctrl-C / kill) temp-файлы чистятся.
+
 """
-import argparse, os, sys, time, tempfile, subprocess, datetime, shutil, signal, atexit, fcntl, json
+import argparse, os, sys, time, tempfile, subprocess, datetime, shutil, signal, atexit, fcntl, json, re
 
 HOME_DIR = os.environ.get("GIGA_TRANSCRIBE_HOME", os.path.expanduser("~/.local/share/giga-transcribe"))
 LOCK_FILE = os.path.join(HOME_DIR, ".transcribe.lock")
@@ -243,15 +251,66 @@ def extract_wav(src, dst):
         die("ffmpeg не смог извлечь аудио:\n" + r.stderr.decode(errors="ignore")[-500:])
 
 
-def run_asr(audio, sr, tmpdir, threads):
-    import gigaam, soundfile as sf
+def probe_channels(src):
+    """Сколько аудиоканалов в файле. Нет ffprobe или не разобрали - считаем моно."""
+    if not shutil.which("ffprobe"):
+        return 1
+    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0",
+                        "-show_entries", "stream=channels", "-of", "csv=p=0", src],
+                       capture_output=True, text=True)
+    try:
+        return int(r.stdout.strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return 1
+
+
+def extract_channel_wav(src, idx, dst):
+    """Один канал многоканального файла -> моно wav 16 кГц (без сведения с соседями)."""
+    r = subprocess.run(["ffmpeg", "-y", "-i", src,
+                        "-filter_complex", f"[0:a]pan=mono|c0=c{idx}[out]", "-map", "[out]",
+                        "-ar", str(SR), "-ac", "1", dst], capture_output=True)
+    if r.returncode != 0 or not os.path.exists(dst):
+        die(f"ffmpeg не смог достать канал {idx}:\n" + r.stderr.decode(errors="ignore")[-500:])
+
+
+def plan_tracks(inputs, split_channels, names_arg):
+    """Список (имя_спикера, источник, индекс_канала|None) для многодорожечного прогона.
+
+    Два источника дорожек, дальше по пайплайну неразличимы:
+      - пофайловый (несколько входных файлов) - имя по умолчанию из имени файла;
+      - поканальный (--split-channels) - имя по умолчанию "Дорожка N".
+    """
+    if split_channels:
+        if len(inputs) != 1:
+            die("--split-channels работает с одним файлом (каналы внутри него)")
+        n = probe_channels(inputs[0])
+        if n < 2:
+            die(f"в файле {os.path.basename(inputs[0])} один канал - раскладывать нечего")
+        tracks = [(f"Дорожка {i+1}", inputs[0], i) for i in range(n)]
+    else:
+        tracks = [(os.path.splitext(os.path.basename(p))[0], p, None) for p in inputs]
+    if names_arg:
+        names = [n.strip() for n in names_arg.split(",")]
+        if len(names) != len(tracks):
+            die(f"--track-names: имен {len(names)}, а дорожек {len(tracks)}")
+        tracks = [(names[i], src, ch) for i, (_, src, ch) in enumerate(tracks)]
+    return tracks
+
+
+def load_asr(threads):
+    """Модель грузится один раз на прогон - на многодорожечном входе это дорогая операция."""
+    import gigaam
     if threads > 0:
         import torch
         torch.set_num_threads(threads)
-    model = gigaam.load_model(ASR_MODEL, device="cpu")
+    return gigaam.load_model(ASR_MODEL, device="cpu")
+
+
+def asr_words(model, audio, sr, tmpdir, tag="chunk"):
+    import soundfile as sf
     words, ch = [], CHUNK_S * sr
     for i in range(0, len(audio), ch):
-        p = os.path.join(tmpdir, f"chunk_{i}.wav")   # tmpdir уникален -> параллель-безопасно
+        p = os.path.join(tmpdir, f"{tag}_{i}.wav")   # tmpdir уникален -> параллель-безопасно
         sf.write(p, audio[i:i+ch], sr)
         off = i / sr
         try:
@@ -420,24 +479,87 @@ def group_by_pause(words, gap=1.2):
     return lines
 
 
-def write_md(path, title, src, dur, lines, diarized, emb_key):
+# --- Многодорожечный вход: спикер известен по построению, диаризация не нужна. ---
+
+def group_track(words, label, gap=1.2):
+    """Слова одной дорожки -> реплики (start, end, label, text), разрез по паузе."""
+    blocks, buf, st, prev = [], [], 0.0, None
+    for a, b, tx in words:
+        if prev is not None and a - prev > gap and buf:
+            blocks.append((st, prev, label, " ".join(buf)))
+            buf, st = [], a
+        if not buf:
+            st = a
+        buf.append(tx)
+        prev = b
+    if buf:
+        blocks.append((st, prev if prev is not None else st, label, " ".join(buf)))
+    return blocks
+
+
+def text_similarity(a, b):
+    """Доля общих слов относительно более короткой реплики (0..1)."""
+    A, B = set(re.findall(r"\w+", a.lower())), set(re.findall(r"\w+", b.lower()))
+    if not A or not B:
+        return 0.0
+    return len(A & B) / min(len(A), len(B))
+
+
+def drop_bleed(blocks, loudness, min_overlap=0.5, min_sim=0.5, quiet_ratio=0.35):
+    """Убирает протечки - одну и ту же речь, попавшую сразу в две дорожки.
+
+    Дорожки бывают изолированные (пофайловый экспорт по участникам) и нет (общий
+    микрофон в комнате, эхо из колонок). Во втором случае чужой голос попадает в
+    соседнюю дорожку тише и обычно с искаженным текстом, и наивное "спикер =
+    дорожка" напечатает одну реплику дважды от разных людей.
+
+    Признак протечки - пересечение по времени ПЛЮС одно из двух: похожий текст
+    либо заметно более тихая запись у одного из двоих. Одного пересечения мало:
+    люди перебивают друг друга и по-настоящему.
+
+    loudness(индекс) -> RMS этой реплики на ее дорожке.
+    """
+    order = sorted(range(len(blocks)), key=lambda i: blocks[i][0])
+    dropped = set()
+    for pos, i in enumerate(order):
+        if i in dropped:
+            continue
+        s1, e1, l1, t1 = blocks[i]
+        for j in order[pos + 1:]:
+            if j in dropped:
+                continue
+            s2, e2, l2, t2 = blocks[j]
+            if s2 >= e1:
+                break                    # блоки отсортированы - дальше пересечений не будет
+            if l1 == l2:
+                continue                 # своя же дорожка, это просто соседние реплики
+            overlap = min(e1, e2) - max(s1, s2)
+            shorter = min(e1 - s1, e2 - s2)
+            if shorter <= 0 or overlap / shorter < min_overlap:
+                continue
+            r1, r2 = loudness(i), loudness(j)
+            quiet = i if r1 <= r2 else j
+            ratio = min(r1, r2) / max(r1, r2) if max(r1, r2) > 0 else 1.0
+            if text_similarity(t1, t2) >= min_sim or ratio < quiet_ratio:
+                dropped.add(quiet)
+                if quiet == i:
+                    break
+    return [b for k, b in enumerate(blocks) if k not in dropped]
+
+
+def write_md(path, title, src, dur, lines, engine, note=None):
     global _partial_md
     today = datetime.date.today().isoformat()
-    engine = f"GigaAM {ASR_MODEL} (ASR)" + (f" + sherpa-onnx/{emb_key} (диаризация)" if diarized else "")
-    spk_ids = sorted({s for _, s, _ in lines if s is not None})
     head = [f"# {title}", "",
-            f"**Файл:** {os.path.basename(src)}  ",
+            f"**Файл:** {src}  ",
             f"**Длительность:** {mmss(dur)}  ",
             f"**Обработано:** {today}, локально  ",
             f"**Движок:** {engine}  "]
-    if diarized:
-        head.append(f"**Спикеров выделено:** {len(spk_ids)} "
-                    f"(разметка надежна на длинных репликах, короткие могут путаться; "
-                    f"сверить и проставить имена вручную)  ")
+    if note:
+        head.append(f"{note}  ")
     head += ["", "## Транскрипт", ""]
     body = []
-    for st, s, tx in lines:
-        label = f"Спикер {s+1}" if s is not None else None
+    for st, label, tx in lines:
         prefix = f"**[{mmss(st)}] {label}:** " if label else f"**[{mmss(st)}]** "
         body.append(prefix + tx.strip())
     # атомарно: пишем в .tmp рядом с целью (та же ФС) и переименовываем
@@ -451,10 +573,17 @@ def write_md(path, title, src, dur, lines, diarized, emb_key):
 def main():
     global _tmpdir
     ap = argparse.ArgumentParser(description="Локальная транскрипция встречи (GigaAM + sherpa) в markdown.")
-    ap.add_argument("input", help="аудио или видео файл (mp4/webm/wav/m4a/...)")
+    ap.add_argument("input", nargs="+",
+                    help="аудио/видео файл (mp4/webm/wav/m4a/...); несколько файлов = дорожки участников")
     ap.add_argument("-o", "--output", help="путь к .md (по умолчанию рядом с входным файлом)")
     ap.add_argument("--speakers", type=int, default=0, help="число участников (точнее диаризация); 0 = авто")
     ap.add_argument("--no-diar", action="store_true", help="без диаризации, чистый текст по паузам")
+    ap.add_argument("--split-channels", action="store_true",
+                    help="один многоканальный файл: каждый канал - отдельный спикер")
+    ap.add_argument("--track-names",
+                    help='имена спикеров по дорожкам через запятую ("Иван,Петр")')
+    ap.add_argument("--no-bleed-filter", action="store_true",
+                    help="не убирать протечки чужого голоса между дорожками")
     ap.add_argument("--embedding", choices=list(EMB), default="campplus", help="эмбеддинг диаризации")
     ap.add_argument("--title", help="заголовок в md (по умолчанию - имя файла)")
     ap.add_argument("--threads", type=int, default=0, help="число CPU-потоков (0 = авто/дефолт библиотек)")
@@ -480,9 +609,12 @@ def main():
                    "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
             os.environ[_v] = str(args.threads)
 
-    src = os.path.abspath(os.path.expanduser(args.input))
-    if not os.path.exists(src):
-        die(f"файл не найден: {src}")
+    inputs = [os.path.abspath(os.path.expanduser(p)) for p in args.input]
+    for p in inputs:
+        if not os.path.exists(p):
+            die(f"файл не найден: {p}")
+    src = inputs[0]
+    multitrack = len(inputs) > 1 or args.split_channels
     out = os.path.abspath(os.path.expanduser(args.output)) if args.output else os.path.splitext(src)[0] + ".md"
     title = args.title or os.path.splitext(os.path.basename(src))[0]
 
@@ -500,28 +632,80 @@ def main():
     import soundfile as sf
     _tmpdir = tempfile.mkdtemp(prefix="transcribe_")
     try:
-        print("[1/4] извлекаю аудио...", file=sys.stderr)
-        wav = os.path.join(_tmpdir, "audio.wav")
-        extract_wav(src, wav)
-        audio, sr = sf.read(wav, dtype="float32")
-        dur = len(audio) / sr
+        if multitrack:
+            tracks = plan_tracks(inputs, args.split_channels, args.track_names)
+            print(f"[1/4] извлекаю аудио: дорожек {len(tracks)}...", file=sys.stderr)
+            loaded, sr = [], SR
+            for k, (name, path, ch) in enumerate(tracks):
+                wav = os.path.join(_tmpdir, f"track_{k}.wav")
+                extract_wav(path, wav) if ch is None else extract_channel_wav(path, ch, wav)
+                a, sr = sf.read(wav, dtype="float32")
+                loaded.append((name, a))
+                os.remove(wav)
+            dur = max(len(a) for _, a in loaded) / sr
 
-        print(f"[2/4] распознавание речи ({dur/60:.1f} мин)...", file=sys.stderr)
-        t = time.time()
-        words = run_asr(audio, sr, _tmpdir, args.threads)
-        print(f"      слов={len(words)}, {time.time()-t:.0f}с", file=sys.stderr)
-
-        if args.no_diar:
-            lines, diarized = group_by_pause(words), False
-        else:
-            print("[3/4] диаризация...", file=sys.stderr)
+            print(f"[2/4] распознавание речи ({dur/60:.1f} мин x {len(loaded)} дорожек)...", file=sys.stderr)
             t = time.time()
-            segs = run_diar(audio, args.speakers, args.embedding, args.threads)
+            model = load_asr(args.threads)
+            blocks, signals = [], []
+            for k, (name, a) in enumerate(loaded):
+                w = asr_words(model, a, sr, _tmpdir, tag=f"t{k}")
+                print(f"      {name}: слов={len(w)}", file=sys.stderr)
+                for b in group_track(w, name):
+                    blocks.append(b)
+                    signals.append(a)
             print(f"      {time.time()-t:.0f}с", file=sys.stderr)
-            lines, diarized = group_by_speaker(words, segs), True
+
+            print("[3/4] свожу дорожки...", file=sys.stderr)
+            if not args.no_bleed_filter:
+                import numpy as np
+
+                def loudness(i):
+                    s0, s1, _, _ = blocks[i]
+                    seg = signals[i][int(s0 * sr):int(s1 * sr)]
+                    return float(np.sqrt(np.mean(seg ** 2))) if len(seg) else 0.0
+
+                kept = drop_bleed(blocks, loudness)
+                if len(kept) < len(blocks):
+                    print(f"      убрано протечек между дорожками: {len(blocks) - len(kept)}",
+                          file=sys.stderr)
+                blocks = kept
+            lines = [(s0, name, tx) for s0, _, name, tx in sorted(blocks)]
+            engine = f"GigaAM {ASR_MODEL} (ASR), спикер = дорожка"
+            note = (f"**Дорожек:** {len(tracks)} ({', '.join(n for n, _, _ in tracks)}) - "
+                    f"разметка точная, диаризация не применялась")
+            src_label = ", ".join(dict.fromkeys(os.path.basename(p) for _, p, _ in tracks))
+        else:
+            print("[1/4] извлекаю аудио...", file=sys.stderr)
+            wav = os.path.join(_tmpdir, "audio.wav")
+            extract_wav(src, wav)
+            audio, sr = sf.read(wav, dtype="float32")
+            dur = len(audio) / sr
+
+            print(f"[2/4] распознавание речи ({dur/60:.1f} мин)...", file=sys.stderr)
+            t = time.time()
+            model = load_asr(args.threads)
+            words = asr_words(model, audio, sr, _tmpdir)
+            print(f"      слов={len(words)}, {time.time()-t:.0f}с", file=sys.stderr)
+
+            if args.no_diar:
+                lines = [(st, None, tx) for st, _, tx in group_by_pause(words)]
+                engine, note = f"GigaAM {ASR_MODEL} (ASR)", None
+            else:
+                print("[3/4] диаризация...", file=sys.stderr)
+                t = time.time()
+                segs = run_diar(audio, args.speakers, args.embedding, args.threads)
+                print(f"      {time.time()-t:.0f}с", file=sys.stderr)
+                grouped = group_by_speaker(words, segs)
+                lines = [(st, f"Спикер {s+1}" if s is not None else None, tx) for st, s, tx in grouped]
+                n_spk = len({s for _, s, _ in grouped if s is not None})
+                engine = f"GigaAM {ASR_MODEL} (ASR) + sherpa-onnx/{args.embedding} (диаризация)"
+                note = (f"**Спикеров выделено:** {n_spk} (разметка надежна на длинных репликах, "
+                        f"короткие могут путаться; сверить и проставить имена вручную)")
+            src_label = os.path.basename(src)
 
         print("[4/4] пишу markdown...", file=sys.stderr)
-        write_md(out, title, src, dur, lines, diarized, args.embedding)
+        write_md(out, title, src_label, dur, lines, engine, note)
         print(out)   # stdout = путь к результату (для пайпов)
     finally:
         _cleanup()
