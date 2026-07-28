@@ -22,9 +22,10 @@ md пишется атомарно, при остановке (Ctrl-C / kill) te
   transcribe-meeting rec.webm -o out.md --speakers 3
   transcribe-meeting audio.wav --no-diar --title "Недельный синк"
 """
-import argparse, os, sys, time, tempfile, subprocess, datetime, shutil, signal, atexit
+import argparse, os, sys, time, tempfile, subprocess, datetime, shutil, signal, atexit, fcntl, json
 
 HOME_DIR = os.environ.get("GIGA_TRANSCRIBE_HOME", os.path.expanduser("~/.local/share/giga-transcribe"))
+LOCK_FILE = os.path.join(HOME_DIR, ".transcribe.lock")
 DIAR_DIR = os.path.join(HOME_DIR, "models")
 SEG_MODEL = os.path.join(DIAR_DIR, "sherpa-onnx-pyannote-segmentation-3-0", "model.onnx")
 EMB = {"campplus": os.path.join(DIAR_DIR, "embedding.onnx"),
@@ -38,6 +39,165 @@ DIAR_KMAX = 6          # верхняя граница числа спикеро
 # --- ресурсы прогона, чистятся при выходе/сигнале ---
 _tmpdir = None
 _partial_md = None
+_lock_fd = None
+
+
+# --- предохранители общей машины (см. docs/runbook-shared-machine.md) ---
+
+
+def detect_project(path):
+    """Чей это прогон - имя папки проекта, из которой пришел файл.
+
+    Ищем вверх по дереву маркер рабочей папки. Нужно только для человеческого
+    сообщения ждущему: "занято проектом X" понятнее, чем "ресурс занят".
+    """
+    cur = os.path.abspath(path)
+    while True:
+        parent = os.path.dirname(cur)
+        if os.path.isdir(parent):
+            for marker in ("CLAUDE.md", ".claude", ".git"):
+                if os.path.exists(os.path.join(parent, marker)):
+                    return os.path.basename(parent)
+        if parent == cur:
+            return os.path.basename(os.getcwd())
+        cur = parent
+
+
+def read_lock_info():
+    try:
+        with open(LOCK_FILE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def describe_holder(info):
+    if not info:
+        return "занято другим прогоном (подробностей нет)"
+    parts = []
+    if info.get("project"):
+        parts.append(f'проект "{info["project"]}"')
+    if info.get("file"):
+        parts.append(f"файл {info['file']}")
+    if info.get("started"):
+        try:
+            started = datetime.datetime.fromisoformat(info["started"])
+            mins = int((datetime.datetime.now() - started).total_seconds() // 60)
+            parts.append(f"идет {mins} мин (с {started.strftime('%H:%M')})")
+        except ValueError:
+            pass
+    if info.get("pid"):
+        parts.append(f"pid {info['pid']}")
+    return ", ".join(parts)
+
+
+def acquire_lock(source, wait, timeout):
+    """Движок один на машину, прогоны идут по очереди.
+
+    Почему именно взаимное исключение, а не просто уникальные имена файлов:
+      - каждый процесс держит порядка полутора гигабайт (модель плюс torch);
+      - каждый ставит число потоков по числу ядер, и два прогона дерутся за CPU,
+        оба идут медленнее, чем шли бы по очереди;
+      - gigaam качает веса НЕ атомарно (пишет прямо в целевой файл и считает
+        существующий готовым), поэтому одновременный первый запуск с новой
+        моделью оставляет битый кэш.
+
+    Лок берется ДО тяжелых импортов: ждущий висит на десятках мегабайт, а не
+    на полутора гигабайтах, поэтому очередь любой длины стоит по памяти как
+    один прогон. Ядро снимает лок при завершении процесса, в том числе аварийном.
+    """
+    global _lock_fd
+    os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+    _lock_fd = open(LOCK_FILE, "a+", encoding="utf-8")  # "a+", не "w": не затираем данные держателя
+    try:
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        holder = describe_holder(read_lock_info())
+        if not wait:
+            die(f"занято: на машине уже идет транскрибация - {holder}.\n"
+                "Запусти позже или убери --no-wait, чтобы встать в очередь.")
+        print(f"Жду очереди: сейчас {holder}", flush=True)
+        print(f"(движок один на машину, прогоны идут последовательно; "
+              f"жду не дольше {timeout // 60} мин)", flush=True)
+        deadline = time.time() + timeout
+        while True:
+            try:
+                fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.time() > deadline:
+                    die(f"не дождался за {timeout // 60} мин: все еще "
+                        f"{describe_holder(read_lock_info())}.\n"
+                        "Если тот прогон завис - сними его вручную и запусти снова.")
+                time.sleep(5)
+    _lock_fd.seek(0)
+    _lock_fd.truncate()
+    json.dump({
+        "pid": os.getpid(),
+        "project": detect_project(source),
+        "file": os.path.basename(source),
+        "model": ASR_MODEL,
+        "started": datetime.datetime.now().isoformat(timespec="seconds"),
+    }, _lock_fd, ensure_ascii=False)
+    _lock_fd.flush()
+
+
+def mem_available_mb():
+    """Свободная память в МБ; None - если система не дает ее дешево узнать."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        return None          # macOS и прочие без /proc - проверку пропускаем
+    return None
+
+
+def wait_for_memory(need_mb, wait, timeout):
+    """Лок свободен - память может быть все равно занята (браузер, агенты, БД).
+
+    Дешевле подождать, чем словить OOM: жертву при нехватке памяти выбирает
+    ядро, а не мы, и ей становится не обязательно транскрибация.
+    """
+    free = mem_available_mb()
+    if free is None or free >= need_mb:
+        return
+    if not wait:
+        die(f"мало памяти: свободно {free} МБ, нужно от {need_mb} МБ. "
+            "Освободи память или запусти позже.")
+    print(f"Жду память: свободно {free} МБ, нужно от {need_mb} МБ", flush=True)
+    deadline = time.time() + timeout
+    while (mem_available_mb() or need_mb) < need_mb:
+        if time.time() > deadline:
+            die(f"память так и не освободилась за {timeout // 60} мин "
+                f"(сейчас {mem_available_mb()} МБ). Прерываюсь, чтобы не ронять машину.")
+        time.sleep(10)
+
+
+def reexec_in_scope(memory_max):
+    """Перезапуск себя в cgroup с лимитом памяти (systemd-run --user --scope).
+
+    Без лимита превышение памяти обрабатывает ГЛОБАЛЬНЫЙ OOM-killer, и жертву он
+    выбирает по всей системе - падает база, докер, что угодно, а не транскрибация.
+    Внутри scope OOM срабатывает локально: худший исход - умер наш прогон, машина жива.
+
+    Своп режем (MemorySwapMax=0): уход инференса в своп кладет отзывчивость машины
+    не хуже нехватки памяти. Нет systemd (macOS, контейнер) - молча работаем как есть.
+    """
+    if os.environ.get("TRANSCRIBE_SCOPE") or not shutil.which("systemd-run"):
+        return
+    # перезапускаем через интерпретатор, а не сам файл: скрипт запускают и как
+    # "python transcribe_meeting.py" (бита +x нет), и как установленную команду
+    cmd = ["systemd-run", "--user", "--scope", "--quiet",
+           "-p", f"MemoryMax={memory_max}", "-p", "MemorySwapMax=0",
+           "--", sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]]
+    env = dict(os.environ, TRANSCRIBE_SCOPE="1")
+    try:
+        os.execvpe(cmd[0], cmd, env)
+    except OSError as exc:                       # нет systemd-user - работаем как есть
+        print(f"Предупреждение: не удалось ограничить память через systemd-run ({exc}); "
+              "иду без лимита", file=sys.stderr, flush=True)
 
 
 def _cleanup():
@@ -298,7 +458,22 @@ def main():
     ap.add_argument("--embedding", choices=list(EMB), default="campplus", help="эмбеддинг диаризации")
     ap.add_argument("--title", help="заголовок в md (по умолчанию - имя файла)")
     ap.add_argument("--threads", type=int, default=0, help="число CPU-потоков (0 = авто/дефолт библиотек)")
+    ap.add_argument("--no-wait", action="store_true",
+                    help="не ждать очереди и памяти, а сразу выйти, если занято")
+    ap.add_argument("--wait-timeout", type=int, default=7200,
+                    help="сколько секунд ждать очереди/памяти (по умолчанию 2 ч)")
+    ap.add_argument("--min-free-mb", type=int, default=2500,
+                    help="не стартовать, пока свободной памяти меньше этого (МБ; только Linux)")
+    ap.add_argument("--memory-max", default="4G",
+                    help="лимит памяти cgroup для прогона (systemd-run --scope; только Linux)")
+    ap.add_argument("--no-limit", action="store_true",
+                    help="не заворачивать прогон в cgroup с лимитом памяти")
     args = ap.parse_args()
+
+    # до всего остального: перезапуск себя под лимитом памяти, чтобы промах
+    # убивал только транскрибацию, а не случайный процесс на машине
+    if not args.no_limit:
+        reexec_in_scope(args.memory_max)
 
     if args.threads and args.threads > 0:
         for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
@@ -310,6 +485,11 @@ def main():
         die(f"файл не найден: {src}")
     out = os.path.abspath(os.path.expanduser(args.output)) if args.output else os.path.splitext(src)[0] + ".md"
     title = args.title or os.path.splitext(os.path.basename(src))[0]
+
+    # очередь и память - ДО тяжелых импортов ниже: ждущий процесс должен стоить
+    # десятки мегабайт, а не полтора гигабайта загруженной модели
+    acquire_lock(src, wait=not args.no_wait, timeout=args.wait_timeout)
+    wait_for_memory(args.min_free_mb, wait=not args.no_wait, timeout=args.wait_timeout)
 
     try:
         import certifi
