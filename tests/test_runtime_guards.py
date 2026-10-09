@@ -29,9 +29,9 @@ class ResourceGuards(unittest.TestCase):
                 self.assertEqual(expected, tm.default_threads())
 
     def test_affinity_overrides_host_cpu_count(self):
-        with patch.object(os, 'sched_getaffinity', return_value={2, 4}), patch.object(os, 'cpu_count', return_value=64):
+        with patch.object(os, 'sched_getaffinity', return_value={2, 4}, create=True), patch.object(os, 'cpu_count', return_value=64):
             self.assertEqual(2, tm.available_cpus())
-        with patch.object(os, 'sched_getaffinity', side_effect=OSError), patch.object(os, 'cpu_count', return_value=None):
+        with patch.object(os, 'sched_getaffinity', side_effect=OSError, create=True), patch.object(os, 'cpu_count', return_value=None):
             self.assertEqual(1, tm.available_cpus())
 
     def test_scope_preserves_memory_limit_in_fast_mode(self):
