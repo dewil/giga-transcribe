@@ -2,7 +2,7 @@
 """
 transcribe-meeting - локальная транскрипция аудио/видео встречи в markdown.
 
-Движок (отобран сравнением с облачным сервисом и Whisper, см. docs/benchmarks.md):
+Движок (отобран сравнением с облачным сервисом и Whisper):
   ASR         - GigaAM v3 e2e_rnnt (русский, локально; бьет локальный Whisper, паритет с облаком по тексту)
   Диаризация  - sherpa-onnx (pyannote-segmentation-3.0 + campplus эмбеддинг), опционально, token-free
 
@@ -40,6 +40,7 @@ EMB = {"campplus": os.path.join(DIAR_DIR, "embedding.onnx"),
        "titanet":  os.path.join(DIAR_DIR, "titanet.onnx")}
 ASR_MODEL = "v3_e2e_rnnt"
 CHUNK_S = 24            # лимит GigaAM .transcribe - 25 сек
+FFMPEG_TIMEOUT = 3600   # потолок на вызов ffmpeg/ffprobe: держим лок машины, зависать нельзя
 SR = 16000
 DIAR_MIN_ON = 0.5      # мин. длина речевого сегмента (баланс: короткие реплики vs шум эмбеддинга)
 DIAR_KMAX = 6          # верхняя граница числа спикеров при авто-оценке (silhouette)
@@ -50,7 +51,7 @@ _partial_md = None
 _lock_fd = None
 
 
-# --- предохранители общей машины (см. docs/runbook-shared-machine.md) ---
+# --- предохранители общей машины (см. README.md, "Очередь прогонов и защита машины") ---
 
 
 def detect_project(path):
@@ -74,7 +75,10 @@ def detect_project(path):
 def read_lock_info():
     try:
         with open(LOCK_FILE, encoding="utf-8") as fh:
-            return json.load(fh)
+            info = json.load(fh)
+        # валидный JSON может оказаться не объектом (чужой формат, обрезок) -
+        # тогда .get() ниже уронил бы ждущего вместо честного ожидания
+        return info if isinstance(info, dict) else {}
     except (OSError, ValueError):
         return {}
 
@@ -169,7 +173,13 @@ def wait_for_memory(need_mb, wait, timeout):
     ядро, а не мы, и ей становится не обязательно транскрибация.
     """
     free = mem_available_mb()
-    if free is None or free >= need_mb:
+    if free is None:
+        # молчание тут читалось бы как "проверено и хватает"
+        print("Предупреждение: свободную память проверить нечем (нет /proc/meminfo) - "
+              "предохранитель по памяти не работает на этой системе",
+              file=sys.stderr, flush=True)
+        return
+    if free >= need_mb:
         return
     if not wait:
         die(f"мало памяти: свободно {free} МБ, нужно от {need_mb} МБ. "
@@ -183,23 +193,94 @@ def wait_for_memory(need_mb, wait, timeout):
         time.sleep(10)
 
 
-def reexec_in_scope(memory_max):
+def available_cpus():
+    """Ядра, доступные этому процессу (affinity/cgroup cpuset), а не всей машине."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 1)
+
+
+def default_threads():
+    """Фоновый дефолт: половина ядер, не больше 4 и не меньше 1.
+
+    Все ядра по умолчанию (прежнее поведение) на общем сервере кладут машину:
+    три длинных прогона подряд подняли нагрузку до 32 на 6 ядрах.
+    """
+    return max(1, min(4, available_cpus() // 2))
+
+
+def resolve_threads(threads, fast):
+    """Число потоков для прогона - всегда конкретное N > 0.
+
+    --threads 0 = все доступные ядра (осознанно), N > 0 - как задано, отрицательное -
+    ошибка. Явный --threads сильнее --fast; без него --fast дает все ядра, а обычный
+    прогон - фоновый дефолт. Ноль в число превращается здесь, а не "на усмотрение
+    библиотек": иначе OMP_NUM_THREADS из окружения молча оставлял torch один поток.
+    """
+    if threads is not None and threads < 0:
+        die(f"--threads не может быть отрицательным: {threads}")
+    if threads is None:
+        threads = 0 if fast else default_threads()
+    return threads if threads > 0 else available_cpus()
+
+
+def lower_priority():
+    """nice 19 для себя и потомков (ffmpeg). Возвращает фактический nice или None при сбое.
+
+    Это основная защита машины вместе с числом потоков. CPUWeight/IOWeight в scope
+    действуют, только если контроллеры cpu/io делегированы пользовательскому
+    systemd (на части машин их нет), поэтому на них не полагаемся.
+    """
+    try:
+        return os.nice(19 - os.nice(0))
+    except OSError:
+        return None
+
+
+def reexec_in_scope(memory_max, background=True):
     """Перезапуск себя в cgroup с лимитом памяти (systemd-run --user --scope).
+
+    background=True добавляет CPUWeight=20 и IOWeight=20 (дефолт 100): прогон
+    уступает CPU и диск остальным процессам машины, но при простое берет все.
 
     Без лимита превышение памяти обрабатывает ГЛОБАЛЬНЫЙ OOM-killer, и жертву он
     выбирает по всей системе - падает база, докер, что угодно, а не транскрибация.
     Внутри scope OOM срабатывает локально: худший исход - умер наш прогон, машина жива.
 
     Своп режем (MemorySwapMax=0): уход инференса в своп кладет отзывчивость машины
-    не хуже нехватки памяти. Нет systemd (macOS, контейнер) - молча работаем как есть.
+    не хуже нехватки памяти. Нет systemd (macOS, контейнер) - предупреждаем и идем
+    без лимита: молчать нельзя, иначе прогон выглядит защищенным, не будучи им.
     """
-    if os.environ.get("TRANSCRIBE_SCOPE") or not shutil.which("systemd-run"):
+    if os.environ.get("TRANSCRIBE_SCOPE"):
+        return
+    if not shutil.which("systemd-run"):
+        print("Предупреждение: systemd-run недоступен (macOS, контейнер) - "
+              "иду без лимита памяти; следите за свободной памятью сами",
+              file=sys.stderr, flush=True)
+        return
+    # Бинарь есть - еще не значит, что scope создастся: в SSH-сессии и контейнере
+    # часто нет user-manager/D-Bus. Проверяем дешевым пробным запуском, потому что
+    # execvpe уже заменил бы наш процесс и откатиться было бы нечем - прогон просто
+    # умер бы с ошибкой systemd вместо работы без лимита.
+    try:
+        probe = subprocess.run(["systemd-run", "--user", "--scope", "--quiet", "--", "true"],
+                               capture_output=True, timeout=15)
+        ok = probe.returncode == 0
+        why = probe.stderr.decode(errors="ignore").strip()[:200]
+    except (OSError, subprocess.SubprocessError) as exc:
+        ok, why = False, str(exc)
+    if not ok:
+        print(f"Предупреждение: systemd-run не может создать scope ({why or 'причина неизвестна'}) - "
+              "иду без лимита памяти", file=sys.stderr, flush=True)
         return
     # перезапускаем через интерпретатор, а не сам файл: скрипт запускают и как
     # "python transcribe_meeting.py" (бита +x нет), и как установленную команду
     cmd = ["systemd-run", "--user", "--scope", "--quiet",
-           "-p", f"MemoryMax={memory_max}", "-p", "MemorySwapMax=0",
-           "--", sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]]
+           "-p", f"MemoryMax={memory_max}", "-p", "MemorySwapMax=0"]
+    if background:
+        cmd += ["-p", "CPUWeight=20", "-p", "IOWeight=20"]
+    cmd += ["--", sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:]]
     env = dict(os.environ, TRANSCRIBE_SCOPE="1")
     try:
         os.execvpe(cmd[0], cmd, env)
@@ -245,8 +326,13 @@ def mmss(t):
 def extract_wav(src, dst):
     if not shutil.which("ffmpeg"):
         die("ffmpeg не найден в PATH (поставь его, напр. `brew install ffmpeg`)")
-    r = subprocess.run(["ffmpeg", "-y", "-i", src, "-ar", str(SR), "-ac", "1", dst],
-                       capture_output=True)
+    try:
+        # таймаут обязателен: лок машины уже взят, и зависший ffmpeg (сетевой
+        # файл, FIFO, битый контейнер) держал бы очередь всех прогонов
+        r = subprocess.run(["ffmpeg", "-y", "-i", src, "-ar", str(SR), "-ac", "1", dst],
+                           capture_output=True, timeout=FFMPEG_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        die(f"ffmpeg не ответил за {FFMPEG_TIMEOUT} с - файл поврежден или недоступен: {src}")
     if r.returncode != 0 or not os.path.exists(dst):
         die("ffmpeg не смог извлечь аудио:\n" + r.stderr.decode(errors="ignore")[-500:])
 
@@ -254,21 +340,33 @@ def extract_wav(src, dst):
 def probe_channels(src):
     """Сколько аудиоканалов в файле. Нет ffprobe или не разобрали - считаем моно."""
     if not shutil.which("ffprobe"):
-        return 1
-    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0",
-                        "-show_entries", "stream=channels", "-of", "csv=p=0", src],
-                       capture_output=True, text=True)
+        die("ffprobe не найден в PATH - число каналов не определить "
+            "(поставьте ffmpeg или уберите --split-channels)")
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0",
+                            "-show_entries", "stream=channels", "-of", "csv=p=0", src],
+                           capture_output=True, text=True, timeout=FFMPEG_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        die(f"ffprobe не ответил за {FFMPEG_TIMEOUT} с: {src}")
     try:
         return int(r.stdout.strip().splitlines()[0])
     except (ValueError, IndexError):
-        return 1
+        # молчаливое "1" маскировало бы отказ probe под моно-файл: пользователь
+        # получил бы "каналов нет" вместо диагноза
+        die(f"не удалось определить число каналов в {src}: {r.stderr.strip()[:200]}")
 
 
 def extract_channel_wav(src, idx, dst):
     """Один канал многоканального файла -> моно wav 16 кГц (без сведения с соседями)."""
-    r = subprocess.run(["ffmpeg", "-y", "-i", src,
-                        "-filter_complex", f"[0:a]pan=mono|c0=c{idx}[out]", "-map", "[out]",
-                        "-ar", str(SR), "-ac", "1", dst], capture_output=True)
+    if not shutil.which("ffmpeg"):
+        die("ffmpeg не найден в PATH (поставь его, напр. `brew install ffmpeg`)")
+    try:
+        r = subprocess.run(["ffmpeg", "-y", "-i", src,
+                            "-filter_complex", f"[0:a]pan=mono|c0=c{idx}[out]", "-map", "[out]",
+                            "-ar", str(SR), "-ac", "1", dst],
+                           capture_output=True, timeout=FFMPEG_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        die(f"ffmpeg не ответил за {FFMPEG_TIMEOUT} с при извлечении канала {idx}")
     if r.returncode != 0 or not os.path.exists(dst):
         die(f"ffmpeg не смог достать канал {idx}:\n" + r.stderr.decode(errors="ignore")[-500:])
 
@@ -293,7 +391,16 @@ def plan_tracks(inputs, split_channels, names_arg):
         names = [n.strip() for n in names_arg.split(",")]
         if len(names) != len(tracks):
             die(f"--track-names: имен {len(names)}, а дорожек {len(tracks)}")
+        if any(not n for n in names):
+            die("--track-names: пустое имя дорожки")
         tracks = [(names[i], src, ch) for i, (_, src, ch) in enumerate(tracks)]
+    # Имена дорожек - идентификатор спикера: одинаковые склеили бы разных людей
+    # в одного и заодно отключили бы между ними фильтр протечки голоса.
+    # Совпасть могут и по умолчанию - у файлов с одинаковым basename из разных папок.
+    labels = [name for name, _, _ in tracks]
+    dupes = sorted({n for n in labels if labels.count(n) > 1})
+    if dupes:
+        die(f"имена дорожек повторяются: {', '.join(dupes)} - задайте разные через --track-names")
     return tracks
 
 
@@ -334,7 +441,7 @@ def _diar_models_ok(emb):
 def _segment(audio, threads):
     """Временные границы речи (лейблы sherpa игнорируем - кластеризуем сами)."""
     import sherpa_onnx
-    nt = threads if threads > 0 else 1
+    nt = threads   # уже конкретное число, см. resolve_threads
     cfg = sherpa_onnx.OfflineSpeakerDiarizationConfig(
         segmentation=sherpa_onnx.OfflineSpeakerSegmentationModelConfig(
             pyannote=sherpa_onnx.OfflineSpeakerSegmentationPyannoteModelConfig(model=SEG_MODEL),
@@ -349,7 +456,7 @@ def _segment(audio, threads):
 def _embed_segments(audio, segs, emb_path, threads):
     """Эмбеддинг каждого сегмента (по всему его аудио). Возвращает (матрица, оставленные сегменты)."""
     import numpy as np, sherpa_onnx
-    nt = threads if threads > 0 else 1
+    nt = threads   # уже конкретное число, см. resolve_threads
     ext = sherpa_onnx.SpeakerEmbeddingExtractor(
         sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=emb_path, num_threads=nt))
     X, kept = [], []
@@ -402,7 +509,14 @@ def _silhouette(Xn, lab):
     s = np.zeros(len(lab))
     for i in range(len(lab)):
         same = lab == lab[i]; same[i] = False
-        a = D[i, same].mean() if same.any() else 0.0
+        if not same.any():
+            # Одиночный кластер: своей внутрикластерной дистанции нет. Классический
+            # silhouette дает такому объекту 0, а не (b-0)/b = 1 - иначе разбиение
+            # "каждый сегмент отдельный спикер" получало бы идеальную оценку и
+            # выигрывало перебор k (наблюдалось на коротких записях).
+            s[i] = 0.0
+            continue
+        a = D[i, same].mean()
         others = [D[i, lab == c].mean() for c in labs if c != lab[i]]
         b = min(others) if others else 0.0
         s[i] = (b - a) / max(a, b) if max(a, b) > 0 else 0.0
@@ -412,8 +526,14 @@ def _silhouette(Xn, lab):
 def run_diar(audio, n_speakers, emb_key, threads):
     import numpy as np
     emb = EMB.get(emb_key)
+    # _segment строит sherpa-конфиг на campplus независимо от выбора, поэтому
+    # проверяем оба файла: иначе с --embedding titanet проверка проходила бы,
+    # а сегментация падала на отсутствующем campplus
+    if not _diar_models_ok(EMB["campplus"]):
+        die(f"нет модели campplus в {DIAR_DIR} (нужна для сегментации при любом --embedding)")
     if not _diar_models_ok(emb):
-        die(f"нет моделей диаризации в {DIAR_DIR} (запусти install.sh)")
+        die(f"нет моделей диаризации в {DIAR_DIR} - доустановите ONNX-модели sherpa-onnx, "
+            f"см. README.md и install.sh")
     segs = _segment(audio, threads)
     if not segs:
         return []
@@ -427,7 +547,9 @@ def run_diar(audio, n_speakers, emb_key, threads):
     else:
         # авто-оценка числа спикеров по silhouette (порог у sherpa ненадежен)
         best_s, lab = -2.0, np.zeros(len(Xn), dtype=int)
-        for k in range(2, min(DIAR_KMAX, len(Xn)) + 1):
+        # верхняя граница - на сегмент меньше, чем сегментов: k == len(Xn) это
+        # разбиение "каждый сегмент - свой спикер", осмысленным решением не бывает
+        for k in range(2, min(DIAR_KMAX, len(Xn) - 1) + 1):
             l = _skmeans(Xn, w, k)
             if len(np.unique(l)) < k:
                 continue
@@ -513,8 +635,8 @@ def drop_bleed(blocks, loudness, min_overlap=0.5, min_sim=0.5, quiet_ratio=0.35)
     соседнюю дорожку тише и обычно с искаженным текстом, и наивное "спикер =
     дорожка" напечатает одну реплику дважды от разных людей.
 
-    Признак протечки - пересечение по времени ПЛЮС одно из двух: похожий текст
-    либо заметно более тихая запись у одного из двоих. Одного пересечения мало:
+    Признак протечки - пересечение по времени, похожий текст
+    и заметно более тихая запись у одного из двоих. Одного пересечения мало:
     люди перебивают друг друга и по-настоящему.
 
     loudness(индекс) -> RMS этой реплики на ее дорожке.
@@ -540,7 +662,10 @@ def drop_bleed(blocks, loudness, min_overlap=0.5, min_sim=0.5, quiet_ratio=0.35)
             r1, r2 = loudness(i), loudness(j)
             quiet = i if r1 <= r2 else j
             ratio = min(r1, r2) / max(r1, r2) if max(r1, r2) > 0 else 1.0
-            if text_similarity(t1, t2) >= min_sim or ratio < quiet_ratio:
+            # Схожесть текста обязательна: одной разницы громкости мало - на
+            # дорожках с разным gain она выбрасывала настоящую тихую реплику,
+            # сказанную поверх чужой. Протечка же - это ТОТ ЖЕ текст тише.
+            if text_similarity(t1, t2) >= min_sim and ratio < quiet_ratio:
                 dropped.add(quiet)
                 if quiet == i:
                     break
@@ -586,7 +711,12 @@ def main():
                     help="не убирать протечки чужого голоса между дорожками")
     ap.add_argument("--embedding", choices=list(EMB), default="campplus", help="эмбеддинг диаризации")
     ap.add_argument("--title", help="заголовок в md (по умолчанию - имя файла)")
-    ap.add_argument("--threads", type=int, default=0, help="число CPU-потоков (0 = авто/дефолт библиотек)")
+    ap.add_argument("--threads", type=int, default=None,
+                    help=f"число CPU-потоков; по умолчанию {default_threads()} (половина ядер, не больше 4); "
+                         "0 = все ядра")
+    ap.add_argument("--fast", action="store_true",
+                    help="быстрый режим для свободной машины: все ядра, обычный приоритет CPU/IO "
+                         "(лимит памяти остается, его снимает --no-limit)")
     ap.add_argument("--no-wait", action="store_true",
                     help="не ждать очереди и памяти, а сразу выйти, если занято")
     ap.add_argument("--wait-timeout", type=int, default=7200,
@@ -602,9 +732,19 @@ def main():
     # до всего остального: перезапуск себя под лимитом памяти, чтобы промах
     # убивал только транскрибацию, а не случайный процесс на машине
     if not args.no_limit:
-        reexec_in_scope(args.memory_max)
+        reexec_in_scope(args.memory_max, background=not args.fast)
+    niceness = None if args.fast else lower_priority()
+    args.threads = resolve_threads(args.threads, args.fast)
+    if args.fast:
+        print(f"Режим: быстрый, {args.threads} потоков, обычный приоритет", file=sys.stderr, flush=True)
+    elif niceness is None:
+        print(f"Режим: фоновый, {args.threads} потоков; ПОНИЗИТЬ ПРИОРИТЕТ НЕ УДАЛОСЬ - "
+              "машину держит только число потоков", file=sys.stderr, flush=True)
+    else:
+        print(f"Режим: фоновый, {args.threads} потоков, nice {niceness} "
+              "(примерно вдвое дольше; для свободной машины --fast)", file=sys.stderr, flush=True)
 
-    if args.threads and args.threads > 0:
+    if args.threads > 0:
         for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
                    "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
             os.environ[_v] = str(args.threads)
@@ -616,6 +756,12 @@ def main():
     src = inputs[0]
     multitrack = len(inputs) > 1 or args.split_channels
     out = os.path.abspath(os.path.expanduser(args.output)) if args.output else os.path.splitext(src)[0] + ".md"
+    # Транскрипт пишется поверх цели, поэтому цель обязана быть .md и не входом:
+    # "-o запись.mp4" иначе заменил бы саму запись текстом (данные не вернуть)
+    if os.path.splitext(out)[1].lower() != ".md":
+        die(f"выходной файл должен быть .md, получено: {out}")
+    if any(os.path.abspath(os.path.expanduser(p)) == out for p in inputs):
+        die("выходной файл совпадает с входным - запись была бы уничтожена")
     title = args.title or os.path.splitext(os.path.basename(src))[0]
 
     # очередь и память - ДО тяжелых импортов ниже: ждущий процесс должен стоить

@@ -65,12 +65,12 @@ class DropBleed(unittest.TestCase):
         kept = tm.drop_bleed(blocks, self.loud([0.20, 0.18]))
         self.assertEqual(blocks, kept)
 
-    def test_drops_much_quieter_even_when_text_garbled(self):
-        # протечка обычно распознается искаженно, поэтому текст не совпадет - спасает громкость
+    def test_keeps_quiet_speech_without_matching_text(self):
+        # разной громкости недостаточно: без похожего текста нельзя удалять речь
         blocks = [(0.0, 2.0, "Иван", "квартальный отчет готов"),
                   (0.1, 1.8, "Петр", "картальны отчт готв")]
         kept = tm.drop_bleed(blocks, self.loud([0.30, 0.05]))
-        self.assertEqual([blocks[0]], kept)
+        self.assertEqual(blocks, kept)
 
     def test_keeps_blocks_that_do_not_overlap(self):
         blocks = [(0.0, 1.0, "Иван", "одно и то же"),

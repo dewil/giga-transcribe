@@ -16,6 +16,24 @@ BIN="$HOME/.local/bin"
 WITH_TITANET=0
 [ "${1:-}" = "--titanet" ] && WITH_TITANET=1
 
+# Never upgrade an existing runtime or its environment through the bootstrap path.
+if [ -e "$HOME_DIR/transcribe_meeting.py" ] || [ -e "$HOME_DIR/venv" ]; then
+  echo "ОШИБКА: окружение уже существует. Для обновления используй deploy.py --home ... --launcher ..." >&2
+  exit 1
+fi
+SOURCE_REPO="$REPO"
+ARCHIVE="$(mktemp -d)"
+trap 'rm -rf "$ARCHIVE"' EXIT
+COMMIT="$(python3 - "$SOURCE_REPO" "$ARCHIVE" <<'PYARCHIVE'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from deploy import archive_commit
+print(archive_commit(Path(sys.argv[1]), 'HEAD', Path(sys.argv[2])))
+PYARCHIVE
+)"
+REPO="$ARCHIVE"
+
 echo "==> каталог установки: $HOME_DIR"
 mkdir -p "$HOME_DIR" "$MODELS" "$BIN"
 
@@ -38,7 +56,7 @@ if [ ! -d "$HOME_DIR/GigaAM" ]; then
   git clone --depth 1 https://github.com/salute-developers/GigaAM.git "$HOME_DIR/GigaAM"
 fi
 echo "==> ставлю GigaAM + зависимости (torch, sherpa-onnx, ...)"
-"$PY" -m pip install -e "$HOME_DIR/GigaAM[torch]"
+"$PY" -m pip install "$HOME_DIR/GigaAM[torch]"
 "$PY" -m pip install sherpa-onnx certifi soundfile numpy
 
 # --- модели диаризации (token-free ONNX из релизов sherpa-onnx) ---
@@ -62,16 +80,9 @@ fi
 
 # --- скрипты + launcher ---
 echo "==> ставлю скрипты"
-cp "$REPO/transcribe_meeting.py" "$HOME_DIR/transcribe_meeting.py"
+python3 "$SOURCE_REPO/deploy.py" --home "$HOME_DIR" --launcher "$BIN/transcribe-meeting" --ref "$COMMIT"
 cp "$REPO/bin/transcribe-quickaction" "$BIN/transcribe-quickaction"
 chmod +x "$BIN/transcribe-quickaction"
-
-cat > "$BIN/transcribe-meeting" <<EOF
-#!/bin/sh
-export GIGA_TRANSCRIBE_HOME="$HOME_DIR"
-exec "$HOME_DIR/venv/bin/python" "$HOME_DIR/transcribe_meeting.py" "\$@"
-EOF
-chmod +x "$BIN/transcribe-meeting"
 
 # --- macOS Быстрое действие ---
 if [ "$(uname)" = "Darwin" ]; then
